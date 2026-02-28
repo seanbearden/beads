@@ -89,6 +89,7 @@ create, update, show, or close operation).`,
 		// Direct mode
 		closedIssues := []*types.Issue{}
 		closedCount := 0
+		var autoClosedRoot *types.Issue // Track auto-closed molecule for --continue coordination
 
 		// Handle local IDs
 		for _, id := range resolvedIDs {
@@ -129,7 +130,10 @@ create, update, show, or close operation).`,
 			closedCount++
 
 			// Auto-close parent molecule if all steps are now complete
-			autoCloseCompletedMolecule(ctx, store, id, actor, session)
+			acRoot := autoCloseCompletedMolecule(ctx, store, id, actor, session)
+			if acRoot != nil {
+				autoClosedRoot = acRoot
+			}
 
 			// Run close hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := store.GetIssue(ctx, id)
@@ -137,9 +141,17 @@ create, update, show, or close operation).`,
 				hookRunner.Run(hooks.EventClose, closedIssue)
 			}
 
+			// Fire hook for auto-closed molecule root
+			if acRoot != nil && hookRunner != nil {
+				hookRunner.Run(hooks.EventClose, acRoot)
+			}
+
 			if jsonOutput {
 				if closedIssue != nil {
 					closedIssues = append(closedIssues, closedIssue)
+				}
+				if acRoot != nil {
+					closedIssues = append(closedIssues, acRoot)
 				}
 			} else {
 				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(id, issueTitleOrEmpty(issue)), reason)
@@ -200,7 +212,7 @@ create, update, show, or close operation).`,
 			closedCount++
 
 			// Auto-close parent molecule if all steps are now complete
-			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
+			acRoot := autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
 
 			// Get updated issue for hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
@@ -208,9 +220,17 @@ create, update, show, or close operation).`,
 				hookRunner.Run(hooks.EventClose, closedIssue)
 			}
 
+			// Fire hook for auto-closed molecule root
+			if acRoot != nil && hookRunner != nil {
+				hookRunner.Run(hooks.EventClose, acRoot)
+			}
+
 			if jsonOutput {
 				if closedIssue != nil {
 					closedIssues = append(closedIssues, closedIssue)
+				}
+				if acRoot != nil {
+					closedIssues = append(closedIssues, acRoot)
 				}
 			} else {
 				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(result.ResolvedID, result.Issue.Title), reason)
@@ -238,20 +258,38 @@ create, update, show, or close operation).`,
 
 		// Handle --continue flag
 		if continueFlag && len(resolvedIDs) == 1 && closedCount > 0 {
-			autoClaim := !noAuto
-			result, err := AdvanceToNextStep(ctx, store, resolvedIDs[0], autoClaim, actor)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not advance to next step: %v\n", err)
-			} else if result != nil {
+			if autoClosedRoot != nil {
+				// Molecule already auto-closed — skip redundant AdvanceToNextStep traversal
 				if jsonOutput {
-					// Include continue result in JSON output
+					closedStep, _ := store.GetIssue(ctx, resolvedIDs[0])
 					outputJSON(map[string]interface{}{
-						"closed":   closedIssues,
-						"continue": result,
+						"closed": closedIssues,
+						"continue": &ContinueResult{
+							ClosedStep:  closedStep,
+							MolComplete: true,
+							MoleculeID:  autoClosedRoot.ID,
+						},
 					})
 					return
 				}
-				PrintContinueResult(result)
+				// Squash suggestion (auto-close message already printed above)
+				fmt.Println("Consider: bd mol squash " + autoClosedRoot.ID + " --summary '...'")
+			} else {
+				autoClaim := !noAuto
+				result, err := AdvanceToNextStep(ctx, store, resolvedIDs[0], autoClaim, actor)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not advance to next step: %v\n", err)
+				} else if result != nil {
+					if jsonOutput {
+						// Include continue result in JSON output
+						outputJSON(map[string]interface{}{
+							"closed":   closedIssues,
+							"continue": result,
+						})
+						return
+					}
+					PrintContinueResult(result)
+				}
 			}
 		}
 
@@ -347,37 +385,45 @@ func checkGateSatisfaction(issue *types.Issue) error {
 }
 
 // autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
-// and if so, auto-closes the molecule root. This prevents stale wisps that are
-// complete but never explicitly closed (e.g., deacon patrol wisps).
-func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, actorName, session string) {
+// and if so, auto-closes the molecule root. Returns the closed root issue for hook
+// invocation and JSON output, or nil if no auto-close occurred.
+func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, actorName, session string) *types.Issue {
 	moleculeID := findParentMolecule(ctx, s, closedStepID)
 	if moleculeID == "" {
-		return // Not part of a molecule
+		return nil // Not part of a molecule
 	}
 
 	// Check if molecule root is already closed
 	root, err := s.GetIssue(ctx, moleculeID)
 	if err != nil || root == nil || root.Status == types.StatusClosed {
-		return
+		return nil
 	}
 
 	// Load progress to check completion
 	progress, err := getMoleculeProgress(ctx, s, moleculeID)
 	if err != nil {
-		return // Best effort — don't fail the close
+		return nil // Best effort — don't fail the close
 	}
 
-	if progress.Completed < progress.Total {
-		return // Not all steps complete yet
+	if progress.Total == 0 || progress.Completed < progress.Total {
+		return nil // Empty molecule or not all steps complete yet
 	}
 
 	// All steps complete — auto-close the molecule root
 	if err := s.CloseIssue(ctx, moleculeID, "all steps complete", actorName, session); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-close completed molecule %s: %v\n", moleculeID, err)
-		return
+		return nil
+	}
+
+	// Re-fetch to get fresh state for hooks and JSON output
+	closedRoot, _ := s.GetIssue(ctx, moleculeID)
+	if closedRoot == nil {
+		closedRoot = root // Fallback to pre-close state
 	}
 
 	if !jsonOutput {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
 	}
+
+	return closedRoot
 }
