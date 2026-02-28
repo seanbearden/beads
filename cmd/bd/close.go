@@ -129,7 +129,7 @@ create, update, show, or close operation).`,
 			closedCount++
 
 			// Auto-close parent molecule if all steps are now complete
-			autoCloseCompletedMolecule(ctx, store, id, reason, actor, session)
+			autoCloseCompletedMolecule(ctx, store, id, actor, session)
 
 			// Run close hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := store.GetIssue(ctx, id)
@@ -200,7 +200,7 @@ create, update, show, or close operation).`,
 			closedCount++
 
 			// Auto-close parent molecule if all steps are now complete
-			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, reason, actor, session)
+			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
 
 			// Get updated issue for hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
@@ -349,7 +349,7 @@ func checkGateSatisfaction(issue *types.Issue) error {
 // autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
 // and if so, auto-closes the molecule root. This prevents stale wisps that are
 // complete but never explicitly closed (e.g., deacon patrol wisps).
-func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, reason, actorName, session string) {
+func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, actorName, session string) {
 	moleculeID := findParentMolecule(ctx, s, closedStepID)
 	if moleculeID == "" {
 		return // Not part of a molecule
