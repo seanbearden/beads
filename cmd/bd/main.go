@@ -147,6 +147,8 @@ func loadEnvironment() {
 	// and resolves BEADS_DIR, redirects, and worktree paths.
 	if beadsDir := beads.FindBeadsDir(); beadsDir != "" {
 		loadBeadsEnvFile(beadsDir)
+		// Non-fatal warning if .beads/ directory has overly permissive access.
+		config.CheckBeadsDirPermissions(beadsDir)
 	}
 }
 
@@ -653,15 +655,10 @@ var rootCmd = &cobra.Command{
 
 		doltCfg.Path = doltPath
 
-		// Pre-flight: clean stale noms LOCK files left by crashed Dolt processes.
-		// These prevent the Dolt server from opening databases (SIGSEGV or
-		// "database is locked"). Safe because we haven't connected yet.
-		// NOTE: Intentionally skipped for embedded mode.
-		if !isEmbeddedMode() {
-			if removed, _ := dolt.CleanStaleNomsLocks(doltPath); removed > 0 {
-				debug.Logf("cleaned %d stale noms LOCK file(s) from %s", removed, doltPath)
-			}
-		}
+		// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+		// directory — including noms/LOCK files. These are Dolt-internal files.
+		// Removing them WILL cause unrecoverable data corruption and data loss.
+		// Dolt manages these files itself; external interference is never safe.
 
 		store, err = newDoltStore(rootCtx, doltCfg)
 
@@ -692,6 +689,15 @@ var rootCmd = &cobra.Command{
 		if dbPath != "" {
 			beadsDir := filepath.Dir(dbPath)
 			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
+		}
+
+		// Wrap store with hook-firing decorator so ALL mutations
+		// automatically fire on_create/on_update/on_close hooks.
+		// Set BD_NO_HOOKS=1 to disable all hook firing (useful for
+		// bulk imports, migrations, or environments where hooks
+		// should not run).
+		if hookRunner != nil && store != nil && !config.GetBool("no-hooks") {
+			store = storage.NewHookFiringStore(store, hookRunner)
 		}
 
 		// Warn if multiple databases detected in directory hierarchy

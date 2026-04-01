@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
@@ -89,12 +88,15 @@ var createCmd = &cobra.Command{
 		// Get silent flag
 		silent, _ := cmd.Flags().GetBool("silent")
 
-		// Warn if creating a test issue in production database (unless silent mode)
+		// Warn if creating a test issue in a database with existing issues.
+		// A brand-new repo with zero issues is not a "production database" (#2898).
 		if isTestIssue(title) && !silent && !debug.IsQuiet() {
-			fmt.Fprintf(os.Stderr, "%s Creating test issue in production database\n", ui.RenderWarn("⚠"))
-			fmt.Fprintf(os.Stderr, "  Title: %q appears to be test data\n", title)
-			fmt.Fprintf(os.Stderr, "  Recommendation: Use isolated test database with --db\n")
-			fmt.Fprintf(os.Stderr, "    bd --db /tmp/test-beads create %q\n", title)
+			if stats, err := store.GetStatistics(context.Background()); err == nil && stats != nil && stats.TotalIssues >= 5 {
+				fmt.Fprintf(os.Stderr, "%s Creating test issue in production database\n", ui.RenderWarn("⚠"))
+				fmt.Fprintf(os.Stderr, "  Title: %q appears to be test data\n", title)
+				fmt.Fprintf(os.Stderr, "  Recommendation: Use isolated test database with --db\n")
+				fmt.Fprintf(os.Stderr, "    bd --db /tmp/test-beads create %q\n", title)
+			}
 		}
 
 		// Get field values
@@ -120,12 +122,6 @@ var createCmd = &cobra.Command{
 		if description == "" && !isTestIssue(title) {
 			if config.GetBool("create.require-description") {
 				FatalError("description is required (set create.require-description: false in config.yaml to disable)")
-			}
-			// Warn if creating an issue without a description (unless silent mode)
-			if !silent && !debug.IsQuiet() {
-				fmt.Fprintf(os.Stderr, "%s Creating issue without description.\n", ui.RenderWarn("⚠"))
-				fmt.Fprintf(os.Stderr, "  Issues without descriptions lack context for future work.\n")
-				fmt.Fprintf(os.Stderr, "  Consider adding --description=\"Why this issue exists and what needs to be done\"\n")
 			}
 		}
 
@@ -730,11 +726,6 @@ var createCmd = &cobra.Command{
 			if pushErr := remoteCache.Push(rootCtx, repoPath); pushErr != nil {
 				FatalError("failed to push to %s: %v\nThe issue was created locally but not synced to the remote.", repoPath, pushErr)
 			}
-		}
-
-		// Run create hook
-		if hookRunner != nil {
-			hookRunner.Run(hooks.EventCreate, issue)
 		}
 
 		if jsonOutput {
