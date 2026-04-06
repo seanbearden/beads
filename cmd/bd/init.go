@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
+	"github.com/steveyegge/beads/cmd/bd/setup"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -20,6 +22,7 @@ import (
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -128,6 +131,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 		// Also treat BEADS_DOLT_SERVER_MODE=1 env var as --server.
 		if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
+			initServerMode = true
+		}
+
+		// Shared server mode still uses a Dolt sql-server, so it must select
+		// the server-backed store path during init. Without this, init can
+		// persist shared-server intent in YAML while still creating an embedded
+		// store and recording dolt_mode=embedded in metadata.json (GH#2946).
+		if sharedServer || strings.EqualFold(os.Getenv("BEADS_DOLT_SHARED_SERVER"), "true") || os.Getenv("BEADS_DOLT_SHARED_SERVER") == "1" {
 			initServerMode = true
 		}
 
@@ -319,6 +330,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		if useLocalBeads {
 			// Create .beads directory with owner-only permissions (0700).
 			if err := os.MkdirAll(beadsDir, config.BeadsDirPerm); err != nil {
+				if os.IsPermission(err) {
+					if runtime.GOOS == "windows" {
+						FatalError("failed to create .beads directory: %v\n\n"+
+							"Windows Controlled Folder Access may be blocking bd.exe.\n"+
+							"To fix: Open Windows Security > Virus & threat protection >\n"+
+							"Ransomware protection > Allow an app through Controlled folder access\n"+
+							"and add bd.exe (typically %%USERPROFILE%%\\go\\bin\\bd.exe).", err)
+					} else {
+						FatalError("failed to create .beads directory: %v\n\n"+
+							"Permission denied. Check directory ownership and permissions:\n"+
+							"  ls -la %s\n"+
+							"  chmod 755 %s", err, filepath.Dir(beadsDir), filepath.Dir(beadsDir))
+					}
+				}
 				FatalError("failed to create .beads directory: %v", err)
 			}
 
@@ -496,7 +521,25 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		store, err := newDoltStore(ctx, doltCfg)
+		// In shared server mode, ensure the shared server is running before
+		// opening the store. EnsureRunning won't auto-start because
+		// ResolveServerMode returns ServerModeExternal, so start it
+		// explicitly via the shared server directory (GH#2946).
+		if sharedServer || doltserver.IsSharedServerMode() {
+			if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+				if state, _ := doltserver.IsRunning(sharedDir); state == nil || !state.Running {
+					if _, startErr := doltserver.Start(sharedDir); startErr != nil {
+						fmt.Fprintf(os.Stderr, "Error: failed to start shared Dolt server: %v\n", startErr)
+						os.Exit(1)
+					}
+					if !quiet {
+						fmt.Printf("  %s Shared Dolt server started\n", ui.RenderPass("✓"))
+					}
+				}
+			}
+		}
+
+		store, err := newDoltStore(ctx, doltCfg, embeddeddolt.WithLock(initLock))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to open Dolt store: %v\n", err)
 			os.Exit(1)
@@ -584,8 +627,23 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Generate project identity UUID if not already set (GH#2372).
 			// This UUID is stored in both metadata.json and the database,
 			// and verified on every connection to detect cross-project leakage.
+			//
+			// When --database is specified and the database already exists on the
+			// server, adopt the existing project_id instead of generating a new
+			// one. This prevents identity mismatch when a second user joins a
+			// shared remote Dolt server. (GH#2922)
 			if cfg.ProjectID == "" {
-				cfg.ProjectID = configfile.GenerateProjectID()
+				if database != "" && store != nil {
+					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
+						cfg.ProjectID = existingID
+						if !quiet {
+							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
+						}
+					}
+				}
+				if cfg.ProjectID == "" {
+					cfg.ProjectID = configfile.GenerateProjectID()
+				}
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -773,6 +831,22 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 
+		// Safety net: ensure beads.role is always set when in a git repo (GH#2950).
+		// Earlier code paths may skip role-setting when BEADS_DIR is set,
+		// promptContributorMode fails, or edge-case flag combinations are used.
+		// This guarantees every init leaves a usable role-configured state.
+		if isGitRepo() {
+			if _, hasRole := getBeadsRole(); !hasRole {
+				fallbackRole := "maintainer"
+				if roleFlag != "" {
+					fallbackRole = roleFlag
+				}
+				if err := setBeadsRole(fallbackRole); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to set beads.role=%s: %v\n", fallbackRole, err)
+				}
+			}
+		}
+
 		// Auto-commit Dolt state so bd doctor doesn't warn about uncommitted
 		// changes and users don't need a separate "bd vc commit" step.
 		if err := store.Commit(ctx, "bd init"); err != nil {
@@ -904,6 +978,17 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 
+		// Auto-setup Claude hooks for project (writes to .claude/settings.json)
+		// so bd prime runs automatically. Skip in stealth mode or when agents are skipped.
+		if !stealth && !skipAgents && !isBareGitRepo() {
+			if err := setup.InstallClaudeProject(stealth); err != nil {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to setup Claude hooks: %v\n", err)
+				}
+				// Non-fatal - continue with init
+			}
+		}
+
 		// Auto-stage and commit beads files so bd doctor doesn't warn about
 		// untracked files or dirty working tree in a clean room setup.
 		// Only runs when not stealth, in a git repo, and using local storage.
@@ -915,6 +1000,17 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				if _, statErr := os.Stat(agentsFileToStage); statErr == nil {
 					agentsCmd := exec.Command("git", "add", agentsFileToStage)
 					_ = agentsCmd.Run()
+				}
+				// Also stage Claude settings if created by init
+				claudeSettingsPath := filepath.Join(".claude", "settings.json")
+				if _, statErr := os.Stat(claudeSettingsPath); statErr == nil {
+					claudeCmd := exec.Command("git", "add", claudeSettingsPath)
+					_ = claudeCmd.Run()
+				}
+				// Also stage CLAUDE.md if created by setup
+				if _, statErr := os.Stat("CLAUDE.md"); statErr == nil {
+					claudeMdCmd := exec.Command("git", "add", "CLAUDE.md")
+					_ = claudeMdCmd.Run()
 				}
 				// Also stage .gitignore if modified by EnsureProjectGitignore
 				if _, statErr := os.Stat(".gitignore"); statErr == nil {
@@ -1346,12 +1442,19 @@ func checkExistingBeadsData(prefix string) error {
 
 // isNonInteractiveInit returns true if init should run without interactive prompts.
 // Precedence: explicit flag > BD_NON_INTERACTIVE env > CI env > terminal detection.
+// Setting BD_NON_INTERACTIVE=0 or BD_NON_INTERACTIVE=false explicitly forces
+// interactive mode, overriding CI detection and terminal checks.
 func isNonInteractiveInit(flagValue bool) bool {
 	if flagValue {
 		return true
 	}
-	if v := os.Getenv("BD_NON_INTERACTIVE"); v == "1" || v == "true" {
-		return true
+	if v := os.Getenv("BD_NON_INTERACTIVE"); v != "" {
+		if v == "1" || v == "true" {
+			return true
+		}
+		// Explicit BD_NON_INTERACTIVE=0/false forces interactive mode,
+		// overriding CI and terminal detection.
+		return false
 	}
 	if v := os.Getenv("CI"); v == "true" || v == "1" {
 		return true

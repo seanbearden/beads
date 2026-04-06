@@ -152,6 +152,30 @@ func loadEnvironment() {
 	}
 }
 
+// repairSharedServerEmbeddedMismatch detects and auto-repairs the case where
+// shared-server mode is active but metadata.json still pins dolt_mode=embedded.
+// This prevents the silent fallback into embedded mode that hides server-backed
+// issue state after upgrades (GH#2949).
+func repairSharedServerEmbeddedMismatch(beadsDir string, cfg *configfile.Config) {
+	if cfg == nil {
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(cfg.DoltMode)) != configfile.DoltModeEmbedded {
+		return
+	}
+	if !doltserver.IsSharedServerMode() {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Notice: shared-server is enabled but metadata.json had dolt_mode=embedded.")
+	cfg.DoltMode = configfile.DoltModeServer
+	if err := cfg.Save(beadsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to auto-repair metadata.json: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Fix manually: set dolt_mode to \"server\" in .beads/metadata.json")
+	} else {
+		fmt.Fprintln(os.Stderr, "Auto-repaired: dolt_mode updated to \"server\" in metadata.json.")
+	}
+}
+
 // loadServerModeFromConfig loads the storage mode (embedded vs server) from
 // metadata.json so that isEmbeddedMode() returns the correct value. Called
 // for commands that skip full DB init but still need to know the mode.
@@ -164,10 +188,78 @@ func loadServerModeFromConfig() {
 	if err != nil || cfg == nil {
 		return
 	}
+	repairSharedServerEmbeddedMismatch(beadsDir, cfg)
 	sm := cfg.IsDoltServerMode()
+	// GH#2946: shared-server override for stale metadata.json (no-db commands)
+	if !sm && doltserver.IsSharedServerMode() {
+		sm = true
+	}
 	serverMode = sm
 	if cmdCtx != nil {
 		cmdCtx.ServerMode = sm
+	}
+}
+
+func preserveRedirectSourceDatabase(beadsDir string) {
+	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
+		return
+	}
+
+	rInfo := beads.ResolveRedirect(beadsDir)
+	if rInfo.WasRedirected && rInfo.SourceDatabase != "" {
+		_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", rInfo.SourceDatabase)
+		if os.Getenv("BD_DEBUG_ROUTING") != "" {
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", rInfo.SourceDatabase)
+		}
+	}
+}
+
+func selectedNoDBBeadsDir() string {
+	selectedDBPath := ""
+	if rootCmd.PersistentFlags().Changed("db") && dbPath != "" {
+		selectedDBPath = dbPath
+	} else if envDB := os.Getenv("BEADS_DB"); envDB != "" {
+		selectedDBPath = envDB
+	} else if envDB := os.Getenv("BD_DB"); envDB != "" {
+		selectedDBPath = envDB
+	} else {
+		selectedDBPath = dbPath
+	}
+	if selectedDBPath != "" {
+		if selectedBeadsDir := resolveCommandBeadsDir(selectedDBPath); selectedBeadsDir != "" {
+			return selectedBeadsDir
+		}
+	}
+	return beads.FindBeadsDir()
+}
+
+func isSelectedNoDBCommand(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Name() == "context" {
+		return true
+	}
+	if cmd.Parent() == nil || cmd.Parent().Name() != "dolt" {
+		return false
+	}
+	switch cmd.Name() {
+	case "push", "pull", "commit":
+		return false
+	default:
+		return true
+	}
+}
+
+func prepareSelectedNoDBContext(beadsDir string) {
+	if beadsDir == "" {
+		return
+	}
+	_ = os.Setenv("BEADS_DIR", beadsDir)
+	loadBeadsEnvFile(beadsDir)
+	preserveRedirectSourceDatabase(beadsDir)
+	if err := config.Initialize(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to reinitialize config for selected beads dir: %v\n", err)
 	}
 }
 
@@ -179,12 +271,6 @@ func resolveCommandBeadsDir(dbPath string) string {
 		return ""
 	}
 
-	// BEADS_DB is an explicit database override, so preserve its legacy
-	// filepath.Dir behavior instead of trying to rediscover a repo-local .beads.
-	if os.Getenv("BEADS_DB") != "" {
-		return filepath.Dir(dbPath)
-	}
-
 	// Use the same validated candidate logic as the helper/reopen path
 	// (GH#2627). This checks filepath.Dir, canonicalized paths, AND
 	// FindBeadsDir — but only returns a candidate whose metadata.json
@@ -192,6 +278,13 @@ func resolveCommandBeadsDir(dbPath string) string {
 	// an explicit --db flag.
 	if beadsDir := resolveBeadsDirForDBPath(dbPath); beadsDir != "" {
 		return beadsDir
+	}
+
+	for dir := filepath.Dir(dbPath); dir != "" && dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		candidate := filepath.Join(dir, ".beads")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
 	}
 
 	// No candidate matched — fall back to parent directory of the db path.
@@ -421,7 +514,9 @@ var rootCmd = &cobra.Command{
 
 		// GH#2677: Load .beads/.env before the noDbCommands early return so that
 		// commands like "bd doctor --server" pick up per-project Dolt credentials.
-		loadEnvironment()
+		if !isSelectedNoDBCommand(cmd) {
+			loadEnvironment()
+		}
 
 		// Load storage mode (embedded vs server) early so that isEmbeddedMode()
 		// returns the correct value for all commands, including those that skip
@@ -520,21 +615,7 @@ var rootCmd = &cobra.Command{
 		// When .beads/redirect points to a shared directory with a different
 		// dolt_database, the source's database name would be lost. Capture it
 		// early and set BEADS_DOLT_SERVER_DATABASE so all store opens use it.
-		redirectInfo := beads.GetRedirectInfo()
-		var sourceDoltDatabase string
-		if redirectInfo.IsRedirected && redirectInfo.LocalDir != "" {
-			rInfo := beads.ResolveRedirect(redirectInfo.LocalDir)
-			sourceDoltDatabase = rInfo.SourceDatabase
-		}
-		// Set env var early so ALL store opens (main + routed) use the correct
-		// database. Redirects may resolve to a shared .beads dir that serves
-		// multiple databases; the env var ensures the right one is selected.
-		if sourceDoltDatabase != "" && os.Getenv("BEADS_DOLT_SERVER_DATABASE") == "" {
-			_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", sourceDoltDatabase)
-			if os.Getenv("BD_DEBUG_ROUTING") != "" {
-				fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", sourceDoltDatabase)
-			}
-		}
+		preserveRedirectSourceDatabase(beads.GetRedirectInfo().LocalDir)
 
 		// Initialize database path
 		if dbPath == "" {
@@ -619,6 +700,12 @@ var rootCmd = &cobra.Command{
 		}
 		if cfg != nil {
 			doltCfg.ServerMode = cfg.IsDoltServerMode()
+			// Shared server mode (dolt.shared-server in config.yaml) is a
+			// form of server mode. Override metadata.json if it still says
+			// embedded — handles installs created before GH#2946 fix.
+			if !doltCfg.ServerMode && doltserver.IsSharedServerMode() {
+				doltCfg.ServerMode = true
+			}
 			serverMode = doltCfg.ServerMode
 			if cmdCtx != nil {
 				cmdCtx.ServerMode = doltCfg.ServerMode
@@ -633,7 +720,9 @@ var rootCmd = &cobra.Command{
 			// config.yaml). Port 0 is fine here — auto-start will resolve it.
 			doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
 			doltCfg.ServerUser = cfg.GetDoltServerUser()
-			doltCfg.ServerPassword = cfg.GetDoltServerPassword()
+			// Use the resolved port for credential lookup — metadata.json port
+			// and runtime port can diverge (e.g., tunnel on 3308 vs local on 3307).
+			doltCfg.ServerPassword = cfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)
 			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
 		} else if cfgErr == nil {
 			// Load returned (nil, nil) — no config file found.
@@ -677,6 +766,17 @@ var rootCmd = &cobra.Command{
 		storeMutex.Lock()
 		storeActive = true
 		storeMutex.Unlock()
+
+		// Auto-import from issues.jsonl when embedded database is empty (GH#2994).
+		// This handles the upgrade path from pre-0.56 (dolt/) to 1.0+ (embeddeddolt/)
+		// where the new embedded database starts empty but the git-tracked JSONL
+		// still has all the user's data.
+		// Skip auto-import when the user is explicitly running "bd import" —
+		// the import command handles JSONL files itself and auto-importing
+		// first would interfere (double-import / upsert confusion).
+		if store != nil && !useReadOnly && cmd.Name() != "import" {
+			maybeAutoImportJSONL(rootCtx, store, beadsDir)
+		}
 
 		// Validate workspace identity for write commands (GH#2438, GH#2372)
 		// Skip for read-only commands since they can't corrupt data

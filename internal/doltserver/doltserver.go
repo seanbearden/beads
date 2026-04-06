@@ -109,16 +109,29 @@ func IsSharedServerMode() bool {
 //
 // Either source can disable auto-start independently — there is no way
 // to force-enable via env when the config file says disabled. Accepted
-// disable values (case-insensitive): "0", "false", "off".
+// disable values: any value strconv.ParseBool recognizes as false
+// ("0", "f", "F", "false", "FALSE", "False") plus "off" (case-insensitive)
+// for backward compatibility.
 //
 // This is used by KillStaleServers and Start to avoid killing or
 // interfering with externally-managed dolt processes (GH#2641).
 func IsAutoStartDisabled() bool {
-	if v := strings.ToLower(os.Getenv("BEADS_DOLT_AUTO_START")); v == "0" || v == "false" || v == "off" {
+	if isFalsyBool(os.Getenv("BEADS_DOLT_AUTO_START")) {
 		return true
 	}
-	v := strings.ToLower(config.GetString("dolt.auto-start"))
-	return v == "false" || v == "0" || v == "off"
+	return isFalsyBool(config.GetString("dolt.auto-start"))
+}
+
+// isFalsyBool returns true when s is a recognized "false" value:
+// anything strconv.ParseBool accepts as false, or "off" (case-insensitive).
+// Leading/trailing whitespace is trimmed before parsing.
+func isFalsyBool(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "off") {
+		return true
+	}
+	b, err := strconv.ParseBool(s)
+	return err == nil && !b
 }
 
 // SharedServerDir returns the directory for shared server state files.
@@ -542,6 +555,18 @@ func EnsureRunningDetailed(beadsDir string) (port int, startedByUs bool, err err
 		return 0, false, fmt.Errorf("Dolt server is not running on port %d, and auto-start is suppressed "+
 			"because the server is externally managed (dolt.auto-start: false or explicit port configured).\n\n"+
 			"Start the external server, or enable auto-start to allow bd to manage the server.\n"+
+			"  To start manually: bd dolt start\n"+
+			"  To check status: bd dolt status", cfg.Port)
+	}
+
+	// Defense-in-depth: if dolt.auto-start is explicitly disabled in
+	// config.yaml or env, never spawn a server even if the caller
+	// somehow reached this point (e.g. stale AutoStart=true in config).
+	if IsAutoStartDisabled() {
+		cfg := DefaultConfig(beadsDir)
+		return 0, false, fmt.Errorf("Dolt server unreachable (port %d) and auto-start is disabled "+
+			"(dolt.auto-start: false in config.yaml or BEADS_DOLT_AUTO_START=0).\n\n"+
+			"Start the server manually or enable auto-start.\n"+
 			"  To start manually: bd dolt start\n"+
 			"  To check status: bd dolt status", cfg.Port)
 	}

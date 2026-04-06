@@ -828,16 +828,36 @@ func TestIsAutoStartDisabled(t *testing.T) {
 		envVal string
 		want   bool
 	}{
+		// strconv.ParseBool falsy values → disabled
 		{"0", true},
+		{"f", true},
+		{"F", true},
 		{"false", true},
 		{"FALSE", true},
 		{"False", true},
+		// backward-compat "off" (case-insensitive) → disabled
 		{"off", true},
 		{"OFF", true},
 		{"Off", true},
+		// whitespace-trimmed falsy values → disabled
+		{" 0 ", true},
+		{" false ", true},
+		{"\toff\n", true},
+		// whitespace-trimmed truthy value → enabled (not disabled)
+		{" true ", false},
+		// strconv.ParseBool truthy values → enabled (not disabled)
 		{"1", false},
+		{"t", false},
+		{"T", false},
 		{"true", false},
+		{"TRUE", false},
+		{"True", false},
+		// empty / unset → enabled (not disabled)
 		{"", false},
+		// unrecognized values → enabled (fail-open, not disabled)
+		{"no", false},
+		{"disabled", false},
+		{"nope", false},
 	}
 	for _, tt := range tests {
 		t.Run("env="+tt.envVal, func(t *testing.T) {
@@ -873,6 +893,10 @@ func TestIsAutoStartDisabled_Sources(t *testing.T) {
 		{"env_enabled_config_disabled", "1", "false", true}, // config still disables; env can't force-enable
 		{"both_empty", "", "", false},                       // neither set
 		{"env_off_config_true", "off", "true", true},        // env wins
+		// config with ParseBool-expanded values
+		{"env_empty_config_f", "", "f", true},  // config "f"
+		{"env_empty_config_F", "", "F", true},  // config "F"
+		{"env_t_config_empty", "t", "", false}, // env truthy, config unset
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1401,5 +1425,88 @@ func TestDefaultConfig_IncludesMode(t *testing.T) {
 	cfg := DefaultConfig(dir)
 	if cfg.Mode != ServerModeOwned {
 		t.Errorf("expected DefaultConfig.Mode = Owned for empty dir, got %v", cfg.Mode)
+	}
+}
+
+// --- Upgrade regression tests (GH#2949) ---
+// Verify that runtime env vars override stale metadata.json dolt_mode=embedded
+// so that upgrades don't silently switch repos into embedded mode.
+
+func TestResolveServerMode_SharedServerOverridesStaleEmbedded(t *testing.T) {
+	// Simulate the GH#2949 bug: metadata.json has dolt_mode=embedded but
+	// the user has BEADS_DOLT_SHARED_SERVER enabled. Before the fix,
+	// ResolveServerMode returned ServerModeEmbedded; after, ServerModeExternal.
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &configfile.Config{
+		Database: "dolt",
+		Backend:  "dolt",
+		DoltMode: configfile.DoltModeEmbedded,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	config.ResetForTesting()
+
+	got := ResolveServerMode(beadsDir)
+	if got != ServerModeExternal {
+		t.Errorf("ResolveServerMode with shared-server + stale embedded = %v, want ServerModeExternal", got)
+	}
+}
+
+func TestResolveServerMode_ServerModeEnvOverridesStaleEmbedded(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &configfile.Config{
+		Database: "dolt",
+		Backend:  "dolt",
+		DoltMode: configfile.DoltModeEmbedded,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	config.ResetForTesting()
+
+	got := ResolveServerMode(beadsDir)
+	if got != ServerModeExternal {
+		t.Errorf("ResolveServerMode with SERVER_MODE=1 + stale embedded = %v, want ServerModeExternal", got)
+	}
+}
+
+func TestResolveServerMode_EmbeddedHonoredWithoutServerEnv(t *testing.T) {
+	// When no server env vars are set, metadata.json embedded mode is correct.
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &configfile.Config{
+		Database: "dolt",
+		Backend:  "dolt",
+		DoltMode: configfile.DoltModeEmbedded,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	config.ResetForTesting()
+
+	got := ResolveServerMode(beadsDir)
+	if got != ServerModeEmbedded {
+		t.Errorf("ResolveServerMode with no server env = %v, want ServerModeEmbedded", got)
 	}
 }

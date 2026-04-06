@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -342,9 +341,49 @@ func wrapLockError(err error) error {
 	if !isLockError(err) {
 		return err
 	}
-	return fmt.Errorf("%w\n\nThe Dolt database is locked. This usually means the Dolt server's "+
-		"storage is held by another process or a stale lock file exists.\n"+
-		"Try restarting the Dolt server, or run 'bd doctor --fix' to clean stale lock files.", err)
+	hint := lockProcessHint()
+	return fmt.Errorf("%w\n\nThe Dolt database is locked.%s\n"+
+		"Try: bd doctor --fix (clears stale locks), or kill the holding process.", err, hint)
+}
+
+// lockProcessHint tries to identify the process holding the database lock.
+// Returns a hint string like " Process 12345 (bd) may be holding the lock."
+// Returns empty string if identification fails or on unsupported platforms.
+func lockProcessHint() string {
+	// Look for other bd/dolt processes that might hold the lock
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		// /proc not available (macOS, Windows, FreeBSD) — skip PID detection
+		return ""
+	}
+
+	myPID := os.Getpid()
+	var holders []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == myPID {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		cmd := string(cmdline)
+		if strings.Contains(cmd, "bd") || strings.Contains(cmd, "dolt") {
+			holders = append(holders, fmt.Sprintf("%d", pid))
+		}
+	}
+
+	if len(holders) == 0 {
+		return ""
+	}
+	if len(holders) == 1 {
+		return fmt.Sprintf(" Process %s (bd/dolt) may be holding the lock.", holders[0])
+	}
+	return fmt.Sprintf(" Processes %s (bd/dolt) may be holding the lock.", strings.Join(holders, ", "))
 }
 
 // withRetry executes an operation with retry for transient errors.
@@ -591,6 +630,15 @@ func (s *DoltStore) BackupDatabase(ctx context.Context, dir string) error {
 	// Register as a backup remote (idempotent — remove first if exists).
 	_ = versioncontrolops.BackupRemove(ctx, s.db, backupName)
 	if err := versioncontrolops.BackupAdd(ctx, s.db, backupName, backupURL); err != nil {
+		// Another backup (e.g. "default" registered by `bd backup init`) may
+		// already point to this URL. In that case, sync using the existing
+		// remote name rather than failing.
+		if conflict := versioncontrolops.ExtractAddressConflictName(err); conflict != "" {
+			if syncErr := versioncontrolops.BackupSync(ctx, s.db, conflict); syncErr != nil {
+				return fmt.Errorf("sync to backup: %w", syncErr)
+			}
+			return nil
+		}
 		return fmt.Errorf("register backup remote: %w", err)
 	}
 	if err := versioncontrolops.BackupSync(ctx, s.db, backupName); err != nil {
@@ -874,8 +922,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			if breaker != nil {
 				breaker.RecordFailure()
 			}
-			return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\nThe Dolt server may not be running. Try:\n  bd dolt start",
-				addr, dialErr)
+			hint := "The Dolt server may not be running. Try:\n  bd dolt start"
+			if !cfg.AutoStart && doltserver.IsAutoStartDisabled() {
+				hint = "Dolt server auto-start is disabled (dolt.auto-start: false).\n" +
+					"Start the server manually:\n  bd dolt start"
+			}
+			return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\n%s",
+				addr, dialErr, hint)
 		}
 	}
 	_ = conn.Close()
@@ -1042,31 +1095,27 @@ func isLocalHost(host string) bool {
 // buildServerDSN constructs a MySQL DSN for connecting to a Dolt server.
 // If database is empty, connects without selecting a database (for init operations).
 func buildServerDSN(cfg *Config, database string) string {
-	var userPart string
-	if cfg.ServerPassword != "" {
-		userPart = fmt.Sprintf("%s:%s", cfg.ServerUser, cfg.ServerPassword)
-	} else {
-		userPart = cfg.ServerUser
+	// go-sql-driver/mysql DSN format: user:password@tcp(host:port)/db?params
+	// The password must not contain unescaped special characters that collide
+	// with DSN delimiters (@ : / ?). Use go-sql-driver's Config.FormatDSN()
+	// which handles escaping correctly.
+	dsnCfg := mysql.Config{
+		User:                 cfg.ServerUser,
+		Passwd:               cfg.ServerPassword,
+		Net:                  "tcp",
+		Addr:                 fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort),
+		DBName:               database,
+		ParseTime:            true,
+		Timeout:              5 * time.Second,
+		ReadTimeout:          10 * time.Second,
+		WriteTimeout:         10 * time.Second,
+		AllowNativePasswords: true,
 	}
-
-	var dbPart string
-	if database != "" {
-		dbPart = "/" + database
-	} else {
-		dbPart = "/"
-	}
-
-	// Timeouts prevent agents from blocking forever when Dolt server hangs.
-	// timeout=5s: TCP connect timeout
-	// readTimeout=10s: I/O read timeout (covers hung queries)
-	// writeTimeout=10s: I/O write timeout
-	params := "parseTime=true&timeout=5s&readTimeout=10s&writeTimeout=10s"
 	if cfg.ServerTLS {
-		params += "&tls=true"
+		dsnCfg.TLSConfig = "true"
 	}
 
-	return fmt.Sprintf("%s@tcp(%s:%d)%s?%s",
-		userPart, cfg.ServerHost, cfg.ServerPort, dbPart, params)
+	return dsnCfg.FormatDSN()
 }
 
 // execWithLongTimeout opens a one-shot database connection with readTimeout=5m
@@ -1244,11 +1293,10 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 		}
 		// Rebuild status views to match current custom status config.
 		// This ensures views stay in sync even after direct SQL config edits.
-		customStatuses := readCustomStatusesFromDB(ctx, db)
-		if _, err := db.ExecContext(ctx, BuildReadyIssuesView(customStatuses)); err != nil {
+		if _, err := db.ExecContext(ctx, BuildReadyIssuesView()); err != nil {
 			return fmt.Errorf("failed to create ready_issues view: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, BuildBlockedIssuesView(customStatuses)); err != nil {
+		if _, err := db.ExecContext(ctx, BuildBlockedIssuesView()); err != nil {
 			return fmt.Errorf("failed to create blocked_issues view: %w", err)
 		}
 		return nil
@@ -1312,13 +1360,11 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("failed to drop fk_dep_depends_on: %w", err)
 	}
 
-	// Create views — dynamically built to incorporate custom status categories.
-	// Read status.custom config directly from DB (DoltStore not yet constructed).
-	customStatuses := readCustomStatusesFromDB(ctx, db)
-	if _, err := db.ExecContext(ctx, BuildReadyIssuesView(customStatuses)); err != nil {
+	// Create views — table-backed, no dynamic IN clauses needed.
+	if _, err := db.ExecContext(ctx, BuildReadyIssuesView()); err != nil {
 		return fmt.Errorf("failed to create ready_issues view: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, BuildBlockedIssuesView(customStatuses)); err != nil {
+	if _, err := db.ExecContext(ctx, BuildBlockedIssuesView()); err != nil {
 		return fmt.Errorf("failed to create blocked_issues view: %w", err)
 	}
 
@@ -2214,43 +2260,13 @@ type DoltStatus = storage.Status
 // StatusEntry is an alias for storage.StatusEntry.
 type StatusEntry = storage.StatusEntry
 
-// readCustomStatusesFromDB reads status.custom config directly from the database.
-// Used during initialization when DoltStore is not yet available.
-// Returns nil on any error (degraded mode — views use built-in statuses only).
-func readCustomStatusesFromDB(ctx context.Context, db *sql.DB) []types.CustomStatus {
-	var value string
-	err := db.QueryRowContext(ctx, "SELECT `value` FROM config WHERE `key` = 'status.custom'").Scan(&value)
-	if err != nil || value == "" {
-		return nil
-	}
-	parsed, parseErr := types.ParseCustomStatusConfig(value)
-	if parseErr != nil {
-		// Degraded mode: log warning, return nil so views use built-in statuses
-		log.Printf("warning: invalid status.custom config: %v. Using built-in statuses only.", parseErr)
-		return nil
-	}
-	return parsed
-}
-
-// RebuildStatusViews regenerates the ready_issues and blocked_issues views
-// based on current custom status configuration. Called within a write
-// transaction when status.custom config changes.
+// RebuildStatusViews regenerates the ready_issues and blocked_issues views.
+// Views are now table-backed (static SQL), so no custom status parameter needed.
 func (s *DoltStore) RebuildStatusViews(ctx context.Context) error {
-	detailed, err := s.GetCustomStatusesDetailed(ctx)
-	if err != nil {
-		// On error, rebuild with built-in statuses only
-		detailed = nil
-	}
-	return s.rebuildStatusViewsWithStatuses(ctx, detailed)
-}
-
-func (s *DoltStore) rebuildStatusViewsWithStatuses(ctx context.Context, customStatuses []types.CustomStatus) error {
-	readySQL := BuildReadyIssuesView(customStatuses)
-	if _, err := s.db.ExecContext(ctx, readySQL); err != nil {
+	if _, err := s.db.ExecContext(ctx, BuildReadyIssuesView()); err != nil {
 		return fmt.Errorf("failed to rebuild ready_issues view: %w", err)
 	}
-	blockedSQL := BuildBlockedIssuesView(customStatuses)
-	if _, err := s.db.ExecContext(ctx, blockedSQL); err != nil {
+	if _, err := s.db.ExecContext(ctx, BuildBlockedIssuesView()); err != nil {
 		return fmt.Errorf("failed to rebuild blocked_issues view: %w", err)
 	}
 	return nil
