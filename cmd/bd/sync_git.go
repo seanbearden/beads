@@ -69,9 +69,9 @@ func gitHasAnyRemotes() bool {
 	return strings.TrimSpace(string(output)) != ""
 }
 
-// gitRemoteGetURL returns the URL for a named git remote.
-func gitRemoteGetURL(remote string) (string, error) {
-	cmd := exec.Command("git", "remote", "get-url", remote)
+// gitOriginGetURL returns the URL for the origin git remote.
+func gitOriginGetURL() (string, error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -79,14 +79,14 @@ func gitRemoteGetURL(remote string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-// gitLsRemoteHasRef checks if a remote has a specific ref.
+// gitOriginHasDoltDataRef checks if origin has refs/dolt/data.
 // Returns false on any error (network, no remote, timeout, etc).
 // Uses a 10s timeout since this is a network call used for auto-detection,
 // and suppresses credential prompts to avoid blocking on SSH remotes.
-func gitLsRemoteHasRef(remote, ref string) bool {
+func gitOriginHasDoltDataRef() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", remote, ref)
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "origin", "refs/dolt/data")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	output, err := cmd.Output()
 	if err != nil {
@@ -110,12 +110,24 @@ func gitURLToDoltRemote(url string) string {
 	if strings.HasPrefix(url, "ssh://") {
 		return "git+" + url
 	}
+	if isWindowsDrivePath(url) {
+		return "git+" + url
+	}
 	// SCP-style: git@github.com:org/repo.git → git+ssh://git@github.com/org/repo.git
 	if idx := strings.Index(url, ":"); idx > 0 && !strings.Contains(url[:idx], "/") {
 		return "git+ssh://" + url[:idx] + "/" + url[idx+1:]
 	}
 	// Fallback: just prepend git+
 	return "git+" + url
+}
+
+func isWindowsDrivePath(path string) bool {
+	if len(path) < 3 || path[1] != ':' {
+		return false
+	}
+	drive := path[0]
+	return ((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')) &&
+		(path[2] == '/' || path[2] == '\\')
 }
 
 // gitBranchHasUpstream checks if a specific branch has an upstream configured.

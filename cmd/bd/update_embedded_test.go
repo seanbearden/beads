@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -185,6 +186,35 @@ func TestEmbeddedUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("update_type_custom", func(t *testing.T) {
+		// Register "agent" as a custom type via bd config (GH#3030).
+		// This writes to Dolt only, NOT to .beads/config.yaml.
+		cfgCmd := exec.Command(bd, "config", "set", "types.custom", "agent,spike")
+		cfgCmd.Dir = dir
+		cfgCmd.Env = bdEnv(dir)
+		if out, err := cfgCmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd config set types.custom failed: %v\n%s", err, out)
+		}
+
+		issue := bdCreate(t, bd, dir, "Custom type update", "--type", "task")
+		// Before the fix (GH#3030), this would fail with "invalid issue type"
+		// because the CLI-level validation could not read custom types from Dolt.
+		bdUpdate(t, bd, dir, issue.ID, "--type", "agent")
+		got := bdShow(t, bd, dir, issue.ID)
+		if string(got.IssueType) != "agent" {
+			t.Errorf("expected type agent, got %s", got.IssueType)
+		}
+	})
+
+	t.Run("update_type_invalid_rejected", func(t *testing.T) {
+		// Verify that truly invalid types are still rejected by the storage layer.
+		issue := bdCreate(t, bd, dir, "Invalid type test", "--type", "task")
+		out := bdUpdateFail(t, bd, dir, issue.ID, "--type", "banana")
+		if !strings.Contains(out, "invalid issue type") {
+			t.Errorf("expected 'invalid issue type' error, got: %s", out)
+		}
+	})
+
 	t.Run("update_design", func(t *testing.T) {
 		issue := bdCreate(t, bd, dir, "Design test", "--type", "task")
 		bdUpdate(t, bd, dir, issue.ID, "--design", "Design notes here")
@@ -239,6 +269,36 @@ func TestEmbeddedUpdate(t *testing.T) {
 		}
 	})
 
+	// GH#3902: --external-ref "" must clear to SQL NULL (matching buildCreateIssue's
+	// pointer semantics), not write an empty string. Otherwise sync/tracker code
+	// that checks ExternalRef == nil silently misclassifies cleared refs as still
+	// tracked, and two cleared issues round-trip with different JSON shapes
+	// (cleared via CLI emits "external_ref":"" while never-set issues omit the field).
+	t.Run("update_external_ref_clear", func(t *testing.T) {
+		a := bdCreate(t, bd, dir, "ExtRef clear A", "--type", "task", "--external-ref", "ref-a")
+		b := bdCreate(t, bd, dir, "ExtRef clear B", "--type", "task", "--external-ref", "ref-b")
+
+		bdUpdate(t, bd, dir, a.ID, "--external-ref", "")
+		// Repeat clear must succeed for a second issue — historical UNIQUE
+		// constraint repro from the issue report.
+		bdUpdate(t, bd, dir, b.ID, "--external-ref", "")
+
+		gotA := bdShow(t, bd, dir, a.ID)
+		gotB := bdShow(t, bd, dir, b.ID)
+		if gotA.ExternalRef != nil {
+			t.Errorf("expected A.external_ref to be nil after clear, got %q", *gotA.ExternalRef)
+		}
+		if gotB.ExternalRef != nil {
+			t.Errorf("expected B.external_ref to be nil after clear, got %q", *gotB.ExternalRef)
+		}
+
+		// JSON output: cleared ref should be omitted via omitempty, not emitted as "".
+		rawA := bdShowJSON(t, bd, dir, a.ID)
+		if strings.Contains(rawA, `"external_ref"`) {
+			t.Errorf("expected external_ref field to be omitted from JSON after clear, got: %s", rawA)
+		}
+	})
+
 	t.Run("update_spec_id", func(t *testing.T) {
 		issue := bdCreate(t, bd, dir, "SpecID test", "--type", "task")
 		bdUpdate(t, bd, dir, issue.ID, "--spec-id", "RFC-007")
@@ -283,6 +343,20 @@ func TestEmbeddedUpdate(t *testing.T) {
 		if got.DeferUntil == nil {
 			t.Error("expected defer_until to be set")
 		}
+		// GH#3233: --defer should also set status=deferred for consistency with `bd defer`
+		if string(got.Status) != "deferred" {
+			t.Errorf("expected status=deferred, got %q", got.Status)
+		}
+	})
+
+	t.Run("update_defer_respects_explicit_status", func(t *testing.T) {
+		// GH#3233: explicit --status should win over the implicit deferred set by --defer
+		issue := bdCreate(t, bd, dir, "Defer+status test", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--defer", "2099-01-15", "--status", "in_progress")
+		got := bdShow(t, bd, dir, issue.ID)
+		if string(got.Status) != "in_progress" {
+			t.Errorf("expected explicit status=in_progress to win, got %q", got.Status)
+		}
 	})
 
 	t.Run("update_defer_clear", func(t *testing.T) {
@@ -292,6 +366,33 @@ func TestEmbeddedUpdate(t *testing.T) {
 		got := bdShow(t, bd, dir, issue.ID)
 		if got.DeferUntil != nil {
 			t.Error("expected defer_until to be cleared")
+		}
+		// GH#3233: clearing defer on a deferred issue must restore ready visibility
+		if string(got.Status) != "open" {
+			t.Errorf("expected status=open after clearing defer, got %q", got.Status)
+		}
+	})
+
+	t.Run("update_defer_past_date_keeps_status_open", func(t *testing.T) {
+		// GH#3233: past-date --defer shouldn't flip status to deferred, because
+		// the warning promises the issue "will appear in bd ready immediately".
+		issue := bdCreate(t, bd, dir, "Past defer test", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--defer", "2000-01-01")
+		got := bdShow(t, bd, dir, issue.ID)
+		if string(got.Status) == "deferred" {
+			t.Errorf("past --defer should not set status=deferred, got %q", got.Status)
+		}
+	})
+
+	t.Run("update_defer_clear_preserves_non_deferred_status", func(t *testing.T) {
+		// GH#3233: clearing defer_until shouldn't clobber a non-deferred status
+		// that was set independently (e.g. in_progress).
+		issue := bdCreate(t, bd, dir, "Defer clear keep status test", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--status", "in_progress")
+		bdUpdate(t, bd, dir, issue.ID, "--defer", "")
+		got := bdShow(t, bd, dir, issue.ID)
+		if string(got.Status) != "in_progress" {
+			t.Errorf("expected status=in_progress to be preserved, got %q", got.Status)
 		}
 	})
 
@@ -759,10 +860,7 @@ func TestEmbeddedUpdateConcurrent(t *testing.T) {
 			for i := 0; i < issuesPerWorker; i++ {
 				// Create an issue.
 				title := fmt.Sprintf("w%d-issue-%d", worker, i)
-				cmd := exec.Command(bd, "create", "--silent", title)
-				cmd.Dir = dir
-				cmd.Env = bdEnv(dir)
-				out, err := cmd.CombinedOutput()
+				out, err := bdRunWithFlockRetry(t, bd, dir, "create", "--silent", title)
 				if err != nil {
 					r.err = fmt.Errorf("create %d: %v\n%s", i, err, out)
 					results[worker] = r
@@ -813,13 +911,15 @@ func TestEmbeddedUpdateConcurrent(t *testing.T) {
 				listCmd := exec.Command(bd, "list", "--json", "--limit", "0")
 				listCmd.Dir = dir
 				listCmd.Env = bdEnv(dir)
-				listOut, err := listCmd.CombinedOutput()
-				if err != nil {
-					r.err = fmt.Errorf("list after update %d: %v\n%s", i, err, listOut)
+				var listStdout, listStderr bytes.Buffer
+				listCmd.Stdout = &listStdout
+				listCmd.Stderr = &listStderr
+				if err := listCmd.Run(); err != nil {
+					r.err = fmt.Errorf("list after update %d: %v\nstdout:\n%s\nstderr:\n%s", i, err, listStdout.String(), listStderr.String())
 					results[worker] = r
 					return
 				}
-				s := string(listOut)
+				s := listStdout.String()
 				start := strings.Index(s, "[")
 				if start < 0 {
 					r.listCounts = append(r.listCounts, 0)
@@ -827,7 +927,7 @@ func TestEmbeddedUpdateConcurrent(t *testing.T) {
 				}
 				var issues []json.RawMessage
 				if jsonErr := json.Unmarshal([]byte(s[start:]), &issues); jsonErr != nil {
-					r.err = fmt.Errorf("list parse %d: %v\nraw: %s", i, jsonErr, s)
+					r.err = fmt.Errorf("list parse %d: %v\nstdout:\n%s\nstderr:\n%s", i, jsonErr, s, listStderr.String())
 					results[worker] = r
 					return
 				}

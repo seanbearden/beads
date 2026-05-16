@@ -161,7 +161,7 @@ Both directions preserve full Dolt commit history.
 - The backup directory is a full Dolt backup — it can be on a local drive, NAS, or DoltHub
 - You can also migrate via Dolt remotes (`bd dolt push` / `bd dolt pull`) if both projects share a remote
 
-See also [DOLT-BACKEND.md](DOLT-BACKEND.md#migrating-between-backends).
+The sections below are the canonical backend migration reference.
 
 ## Federation (Peer-to-Peer Sync)
 
@@ -244,9 +244,11 @@ When someone clones a repository that uses Dolt backend:
 - Clones the Dolt database from the remote (instead of creating a fresh one)
 - Configures the Dolt remote for future `bd dolt push`/`pull`
 
-If `sync.git-remote` is set in `.beads/config.yaml`, that takes precedence
-over auto-detection. `bd init` will warn if it detects `refs/dolt/data` on
-origin and suggest using `bd bootstrap` instead.
+If `sync.remote` is set in `.beads/config.yaml`, that takes precedence
+over auto-detection. Any Dolt-compatible remote URL is supported (DoltHub,
+S3, GCS, file, or git). On brand-new projects, `bd init` auto-detects
+`git origin` and persists it as `sync.remote`, so the first `bd dolt push`
+publishes Dolt history to `refs/dolt/data` on the same git remote.
 
 ### Verifying Bootstrap Worked
 
@@ -341,9 +343,6 @@ dolt:
   # at ~/.beads/shared-server/. Each project uses its own database (prefix-based).
   # Eliminates port conflicts and reduces resource usage on multi-project machines.
   shared-server: false   # true | false
-
-  # Idle auto-stop timeout for the Dolt server (default: "30m", "0" disables)
-  idle-timeout: 30m
 ```
 
 ### Environment Variables

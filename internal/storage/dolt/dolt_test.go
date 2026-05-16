@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -52,9 +51,7 @@ func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 // TestMain in testmain_test.go.
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("Dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	if testServerPort == 0 {
 		t.Skip("Test Dolt server not running, skipping test")
 	}
@@ -116,16 +113,6 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 
 	// Create an isolated branch for this test
 	_, branchCleanup := testutil.StartTestBranch(t, store.db, testSharedDB)
-
-	// Re-create dolt_ignore'd tables (wisps, etc.) on the branch.
-	// These tables are in dolt_ignore so they only exist in the working set,
-	// not in commits. Branching from main doesn't inherit them.
-	if err := createIgnoredTables(store.db); err != nil {
-		branchCleanup()
-		store.Close()
-		os.RemoveAll(tmpDir)
-		t.Fatalf("createIgnoredTables on branch failed: %v", err)
-	}
 
 	cleanup := func() {
 		branchCleanup()
@@ -1437,7 +1424,7 @@ func TestDeleteIssuesCircularDeps(t *testing.T) {
 	// the cycle detection in AddDependency -- this test exercises DeleteIssues'
 	// ability to handle cycles that may exist in the database, not AddDependency.
 	if _, err := store.execContext(ctx, `
-		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
+		INSERT INTO dependencies (issue_id, depends_on_issue_id, type, created_at, created_by, metadata)
 		VALUES (?, ?, 'blocks', NOW(), 'tester', '{}')
 	`, "circ-a", "circ-c"); err != nil {
 		t.Fatalf("failed to insert cycle-completing dep circ-a->circ-c: %v", err)

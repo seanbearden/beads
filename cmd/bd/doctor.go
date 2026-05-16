@@ -167,7 +167,7 @@ Examples:
   bd doctor --fix -i     # Confirm each fix individually
   bd doctor --fix --fix-child-parent  # Also fix child→parent deps (opt-in)
   bd doctor --fix --force # Force repair even when database can't be opened
-  bd doctor --fix --source=jsonl # Rebuild database from JSONL (source of truth)
+  bd doctor --fix --source=jsonl # Rebuild database from a JSONL export
   bd doctor --dry-run    # Preview what --fix would do without making changes
   bd doctor --perf       # Performance diagnostics
   bd doctor --output diagnostics.json  # Export diagnostics to file
@@ -184,7 +184,7 @@ Examples:
   bd doctor --migration=post   # Validate Dolt migration completed
   bd doctor --migration=pre --json  # Machine-parseable migration validation`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if isEmbeddedMode() {
+		if !usesSQLServer() {
 			fmt.Fprintln(os.Stderr, "Note: 'bd doctor' is not yet supported in embedded mode.")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "For embedded mode troubleshooting:")
@@ -192,6 +192,10 @@ Examples:
 			fmt.Fprintln(os.Stderr, "  • Check bd version:        bd version")
 			fmt.Fprintln(os.Stderr, "  • Reinitialize if needed:  bd init --force")
 			fmt.Fprintln(os.Stderr, "  • Switch to server mode:   bd init --server")
+			os.Exit(0)
+		}
+		if usesProxiedServer() {
+			fmt.Fprintln(os.Stderr, "Note: 'bd doctor' is not yet supported in proxied-server mode.")
 			os.Exit(0)
 		}
 		// Use global jsonOutput set by PersistentPreRun
@@ -338,6 +342,10 @@ func init() {
 	doctorCmd.Flags().BoolVar(&doctorAgent, "agent", false, "Agent-facing diagnostic mode: rich context for AI agents (ZFC-compliant)")
 }
 
+func shouldSkipDoctorNetworkChecks() bool {
+	return jsonOutput || !ui.IsTerminal()
+}
+
 func runDiagnostics(path string) doctorResult {
 	result := doctorResult{
 		Path:       path,
@@ -347,7 +355,8 @@ func runDiagnostics(path string) doctorResult {
 
 	// Auto-detect orchestrator mode: routes.jsonl is only created by orchestrator workspaces
 	if !doctorOrchestrator {
-		routesFile := filepath.Join(path, ".beads", "routes.jsonl")
+		resolvedBeadsDir := doctor.ResolveBeadsDirForRepo(path)
+		routesFile := filepath.Join(resolvedBeadsDir, "routes.jsonl")
 		if _, err := os.Stat(routesFile); err == nil {
 			doctorOrchestrator = true
 		}
@@ -479,13 +488,22 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
-	// Check 4: CLI version (GitHub)
-	versionCheck := convertWithCategory(doctor.CheckCLIVersion(Version), doctor.CategoryCore)
+	// Network-based update checks are skipped in machine-readable and other
+	// non-interactive contexts so doctor remains deterministic under wrappers.
+	versionCheckFn := doctor.CheckCLIVersion
+	pluginCheckFn := doctor.CheckClaudePlugin
+	if shouldSkipDoctorNetworkChecks() {
+		versionCheckFn = doctor.CheckCLIVersionLocalOnly
+		pluginCheckFn = doctor.CheckClaudePluginLocalOnly
+	}
+
+	// Check 4: CLI version
+	versionCheck := convertWithCategory(versionCheckFn(Version), doctor.CategoryCore)
 	result.Checks = append(result.Checks, versionCheck)
 	// Don't fail overall check for outdated CLI, just warn
 
 	// Check 4.5: Claude plugin version (if running in Claude Code)
-	pluginCheck := convertWithCategory(doctor.CheckClaudePlugin(), doctor.CategoryIntegration)
+	pluginCheck := convertWithCategory(pluginCheckFn(), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, pluginCheck)
 	// Don't fail overall check for outdated plugin, just warn
 
@@ -603,12 +621,12 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, bdPrimeOutputCheck)
 	// Don't fail overall check for prime output issues, just warn
 
-	// Check 11e: bd in PATH (needed for Claude hooks to work)
+	// Check 11d: bd in PATH (needed for Claude hooks and other integrations)
 	bdPathCheck := convertWithCategory(doctor.CheckBdInPath(), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, bdPathCheck)
 	// Don't fail overall check for missing bd in PATH, just warn
 
-	// Check 11f: Documentation bd prime references match installed version
+	// Check 11e: Documentation bd prime references match installed version
 	bdPrimeDocsCheck := convertWithCategory(doctor.CheckDocumentationBdPrimeReference(path), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, bdPrimeDocsCheck)
 	// Don't fail overall check for doc mismatch, just warn
@@ -617,6 +635,11 @@ func runDiagnostics(path string) doctorResult {
 	agentDocsCheck := convertWithCategory(doctor.CheckAgentDocumentation(path), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, agentDocsCheck)
 	// Don't fail overall check for missing docs, just warn
+
+	// Check 12a: AGENTS.md / CLAUDE.md user-authored divergence
+	agentDocDivergenceCheck := convertWithCategory(doctor.CheckAgentDocDivergence(path), doctor.CategoryIntegration)
+	result.Checks = append(result.Checks, agentDocDivergenceCheck)
+	// Don't fail overall check for divergence, just warn
 
 	// Check 13: Legacy beads slash commands in documentation
 	legacyDocsCheck := convertWithCategory(doctor.CheckLegacyBeadsSlashCommands(path), doctor.CategoryMetadata)
@@ -773,6 +796,14 @@ func runDiagnostics(path string) doctorResult {
 	classicArtifactsCheck := convertDoctorCheck(doctor.CheckClassicArtifacts(path))
 	result.Checks = append(result.Checks, classicArtifactsCheck)
 	// Don't fail overall check for classic artifacts, just warn
+
+	// Check 34: Linux btrfs NoCOW on .beads/ (GH nocow-beads-dolt-init)
+	// Warns when the dolt data directory sits on btrfs without FS_NOCOW_FL,
+	// which causes kworker thrashing on the hot append-only write path. Safe
+	// no-op on non-Linux and non-btrfs filesystems.
+	btrfsNoCowCheck := convertDoctorCheck(doctor.CheckBtrfsNoCOW(path))
+	result.Checks = append(result.Checks, btrfsNoCowCheck)
+	// Don't fail overall check for btrfs NoCOW, just warn
 
 	// GH#1095: Filter out suppressed checks (doctor.suppress.<slug> = true)
 	suppressed := doctor.GetSuppressedChecksWithStore(sharedStore)

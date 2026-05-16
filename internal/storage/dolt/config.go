@@ -50,13 +50,6 @@ func (s *DoltStore) SetConfig(ctx context.Context, key, value string) error {
 	}
 	s.cacheMu.Unlock()
 
-	// Rebuild status views when custom statuses change
-	if key == "status.custom" {
-		if err := s.RebuildStatusViews(ctx); err != nil {
-			return fmt.Errorf("failed to rebuild status views: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -102,6 +95,26 @@ func (s *DoltStore) GetMetadata(ctx context.Context, key string) (string, error)
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		value, err = issueops.GetMetadataInTx(ctx, tx, key)
+		return err
+	})
+	return value, err
+}
+
+// SetLocalMetadata sets a value in the dolt-ignored local_metadata table.
+// Used for clone-local state that should not generate merge conflicts.
+func (s *DoltStore) SetLocalMetadata(ctx context.Context, key, value string) error {
+	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.SetLocalMetadataInTx(ctx, tx, key, value)
+	})
+}
+
+// GetLocalMetadata retrieves a value from the dolt-ignored local_metadata table.
+// Returns ("", nil) if the key does not exist.
+func (s *DoltStore) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetLocalMetadataInTx(ctx, tx, key)
 		return err
 	})
 	return value, err
@@ -193,7 +206,7 @@ func (s *DoltStore) GetCustomTypes(ctx context.Context) ([]string, error) {
 		if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
 			return yamlTypes, nil
 		}
-		return nil, nil
+		return nil, err
 	}
 
 	s.cacheMu.Lock()

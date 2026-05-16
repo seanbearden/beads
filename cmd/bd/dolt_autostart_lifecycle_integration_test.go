@@ -18,7 +18,7 @@ func TestE2E_AutoStartedRepoLocalServerPersistsAcrossCommands(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow integration test in short mode")
 	}
-	if isEmbeddedMode() {
+	if !usesSQLServer() {
 		t.Skip("skipping: bd dolt status not supported in embedded mode")
 	}
 	if runtime.GOOS == windowsOS {
@@ -131,7 +131,7 @@ func buildLifecycleTestBinary(t *testing.T) string {
 		t.Fatalf("getwd: %v", err)
 	}
 	bdBinary := filepath.Join(t.TempDir(), "bd")
-	cmd := exec.Command("go", "build", "-o", bdBinary, ".")
+	cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", bdBinary, ".")
 	cmd.Dir = pkgDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {

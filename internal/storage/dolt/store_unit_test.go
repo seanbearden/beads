@@ -9,6 +9,7 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // newTestDoltDB creates a temporary database on the test Dolt server.
@@ -24,7 +25,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 
 	dbName := uniqueTestDBName(t)
 
-	adminDSN := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", testServerPort)
+	adminDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root"}.String()
 	admin, err := sql.Open("mysql", adminDSN)
 	if err != nil {
 		t.Fatalf("failed to connect to test Dolt server: %v", err)
@@ -35,7 +36,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 	}
 	admin.Close()
 
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s", testServerPort, dbName)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("failed to connect to test database %s: %v", dbName, err)
@@ -345,6 +346,89 @@ func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 
 	if cfg.ServerPort != 0 {
 		t.Errorf("expected ServerPort=0 (ephemeral, resolved by auto-start), got %d", cfg.ServerPort)
+	}
+}
+
+// TestApplyConfigDefaults_SocketFromEnv verifies that BEADS_DOLT_SERVER_SOCKET
+// populates ServerSocket when not already set.
+func TestApplyConfigDefaults_SocketFromEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/test-dolt.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/test-dolt.sock" {
+		t.Errorf("expected ServerSocket from env, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestApplyConfigDefaults_SocketExplicitOverridesEnv verifies that an explicit
+// ServerSocket in Config takes precedence over the env var.
+func TestApplyConfigDefaults_SocketExplicitOverridesEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/env-socket.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{ServerSocket: "/tmp/explicit.sock"}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/explicit.sock" {
+		t.Errorf("expected explicit socket to win, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestBuildServerDSN_WithSocket verifies that buildServerDSN produces a unix
+// DSN when ServerSocket is configured.
+func TestBuildServerDSN_WithSocket(t *testing.T) {
+	cfg := &Config{
+		ServerSocket: "/tmp/dolt.sock",
+		ServerUser:   "root",
+		ServerHost:   "127.0.0.1",
+		ServerPort:   3307,
+		Database:     "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "unix" {
+		t.Errorf("expected Net=unix, got %q", parsed.Net)
+	}
+	if parsed.Addr != "/tmp/dolt.sock" {
+		t.Errorf("expected Addr=/tmp/dolt.sock, got %q", parsed.Addr)
+	}
+	// TLS defaults to false (no TLS requested), same as TCP.
+	if parsed.TLSConfig != "false" {
+		t.Errorf("expected tls=false (default), got %q", parsed.TLSConfig)
+	}
+}
+
+// TestBuildServerDSN_WithoutSocket verifies TCP DSN is unaffected.
+func TestBuildServerDSN_WithoutSocket(t *testing.T) {
+	cfg := &Config{
+		ServerUser: "root",
+		ServerHost: "127.0.0.1",
+		ServerPort: 3307,
+		Database:   "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "tcp" {
+		t.Errorf("expected Net=tcp, got %q", parsed.Net)
 	}
 }
 

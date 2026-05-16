@@ -12,6 +12,7 @@ import (
 const GitignoreTemplate = `# Dolt database (managed by Dolt, not git)
 dolt/
 embeddeddolt/
+proxieddb/
 
 # Runtime files
 bd.sock
@@ -22,9 +23,6 @@ last-touched
 
 # Daemon runtime (lock, log, pid)
 daemon.*
-
-# Interactions log (runtime, not versioned)
-interactions.jsonl
 
 # Push state (runtime, per-machine)
 push-state.json
@@ -90,6 +88,7 @@ var ProjectGitignorePatterns = []string{
 	".dolt/",
 	"*.db",
 	".beads-credential-key",
+	".beads/proxieddb/",
 }
 
 // projectGitignoreComment is the section header added to the project .gitignore
@@ -107,6 +106,7 @@ var requiredPatterns = []string{
 	"export-state.json",
 	"dolt/",
 	"embeddeddolt/",
+	"proxieddb/",
 	"ephemeral.sqlite3",
 	"dolt-server.pid",
 	"dolt-server.log",
@@ -114,7 +114,6 @@ var requiredPatterns = []string{
 	"dolt-server.port",
 	"dolt-server.activity",
 	"daemon.*",
-	"interactions.jsonl",
 	"*.lock",
 	"*.corrupt.backup/",
 	".beads-credential-key",

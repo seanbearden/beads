@@ -10,6 +10,35 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+type DepTargetKind int
+
+const (
+	DepTargetIssue DepTargetKind = iota
+	DepTargetWisp
+	DepTargetExternal
+)
+
+func (k DepTargetKind) Column() string {
+	switch k {
+	case DepTargetWisp:
+		return "depends_on_wisp_id"
+	case DepTargetExternal:
+		return "depends_on_external"
+	default:
+		return "depends_on_issue_id"
+	}
+}
+
+func ClassifyDepTarget(ctx context.Context, tx *sql.Tx, dep *types.Dependency, isCrossPrefix bool) DepTargetKind {
+	if isCrossPrefix || strings.HasPrefix(dep.DependsOnID, "external:") {
+		return DepTargetExternal
+	}
+	if IsActiveWispInTx(ctx, tx, dep.DependsOnID) {
+		return DepTargetWisp
+	}
+	return DepTargetIssue
+}
+
 // AddDependencyOpts configures AddDependencyInTx behavior.
 // When fields are left empty, AddDependencyInTx performs wisp routing
 // automatically via IsActiveWispInTx. Callers that have already determined
@@ -31,6 +60,10 @@ type AddDependencyOpts struct {
 	// IsCrossPrefix is true when source and target have different prefixes,
 	// meaning the target lives in another rig's database.
 	IsCrossPrefix bool
+	// SkipCycleCheck skips the recursive pre-insert cycle check for callers
+	// that intentionally trade validation cost for bulk graph wiring speed.
+	SkipCycleCheck bool
+	TargetKind     *DepTargetKind
 }
 
 // AddDependencyInTx validates and inserts a dependency within an existing
@@ -71,7 +104,7 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 
 	depTables := opts.DepTables
 	if len(depTables) == 0 {
-		depTables = []string{"dependencies", "wisp_dependencies"}
+		depTables = cycleDetectionTables()
 	}
 
 	metadata := dep.Metadata
@@ -120,28 +153,10 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	}
 
 	// Cycle detection for blocking deps via recursive CTE.
-	if dep.Type == types.DepBlocks || dep.Type == types.DepConditionalBlocks {
-		// Build UNION ALL across all dep tables for the CTE.
-		var unions []string
-		for _, t := range depTables {
-			//nolint:gosec // G201: depTables are caller-controlled constants
-			unions = append(unions, fmt.Sprintf("SELECT issue_id, depends_on_id FROM %s WHERE type IN ('blocks', 'conditional-blocks')", t))
-		}
-		unionQuery := strings.Join(unions, " UNION ALL ")
-
+	if !opts.SkipCycleCheck && (dep.Type == types.DepBlocks || dep.Type == types.DepConditionalBlocks) {
 		var reachable int
-		//nolint:gosec // G201: unionQuery built from caller-controlled table names
-		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`
-			WITH RECURSIVE reachable AS (
-				SELECT ? AS node, 0 AS depth
-				UNION ALL
-				SELECT d.depends_on_id, r.depth + 1
-				FROM reachable r
-				JOIN (%s) d ON d.issue_id = r.node
-				WHERE r.depth < 100
-			)
-			SELECT COUNT(*) FROM reachable WHERE node = ?
-		`, unionQuery), dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
+		query := cycleReachabilityQuery(depTables)
+		if err := tx.QueryRowContext(ctx, query, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
 			return fmt.Errorf("failed to check for dependency cycle: %w", err)
 		}
 		if reachable > 0 {
@@ -170,12 +185,87 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		return fmt.Errorf("failed to check existing dependency: %w", err)
 	}
 
-	//nolint:gosec // G201: writeTable is from WispTableRouting
+	var kind DepTargetKind
+	if opts.TargetKind != nil {
+		kind = *opts.TargetKind
+	} else {
+		kind = ClassifyDepTarget(ctx, tx, dep, opts.IsCrossPrefix)
+	}
+
+	//nolint:gosec // G201: writeTable from WispTableRouting; target column from DepTargetKind.Column()
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+		INSERT INTO %s (issue_id, %s, type, created_at, created_by, metadata, thread_id)
 		VALUES (?, ?, ?, NOW(), ?, ?, ?)
-	`, writeTable), dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
+	`, writeTable, kind.Column()), dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
 		return fmt.Errorf("failed to add dependency: %w", err)
+	}
+	return nil
+}
+
+// cycleReachabilityQuery uses UNION distinct recursion so cyclic and diamond
+// graphs terminate by unique reachable node instead of enumerating paths.
+func cycleReachabilityQuery(depTables []string) string {
+	if len(depTables) == 1 {
+		return fmt.Sprintf(`
+			WITH RECURSIVE reachable(node) AS (
+				SELECT ?
+				UNION
+				SELECT d.depends_on_id
+				FROM reachable r
+				JOIN %s d ON d.issue_id = r.node AND d.type IN ('blocks', 'conditional-blocks')
+			)
+			SELECT COUNT(*) FROM reachable WHERE node = ?
+		`, depTables[0])
+	}
+
+	var unions []string
+	for _, t := range depTables {
+		unions = append(unions, fmt.Sprintf("SELECT issue_id, depends_on_id FROM %s WHERE type IN ('blocks', 'conditional-blocks')", t))
+	}
+	unionQuery := strings.Join(unions, " UNION ")
+	return fmt.Sprintf(`
+		WITH RECURSIVE reachable(node) AS (
+			SELECT ?
+			UNION
+			SELECT d.depends_on_id
+			FROM reachable r
+			JOIN (%s) d ON d.issue_id = r.node
+		)
+		SELECT COUNT(*) FROM reachable WHERE node = ?
+	`, unionQuery)
+}
+
+func cycleDetectionTables() []string {
+	return []string{"dependencies", "wisp_dependencies"}
+}
+
+func DeleteWispFromDependenciesInTx(ctx context.Context, tx *sql.Tx, wispID string) error {
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM dependencies WHERE depends_on_wisp_id = ?", wispID); err != nil {
+		return fmt.Errorf("delete wisp %s from dependencies: %w", wispID, err)
+	}
+	return nil
+}
+
+//nolint:gosec // G201: inClause contains only ? placeholders
+func DeleteWispsFromDependenciesInTx(ctx context.Context, tx *sql.Tx, wispIDs []string) error {
+	if len(wispIDs) == 0 {
+		return nil
+	}
+	inClause, args := buildSQLInClause(wispIDs)
+	if _, err := tx.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_wisp_id IN (%s)", inClause),
+		args...); err != nil {
+		return fmt.Errorf("delete wisps from dependencies: %w", err)
+	}
+	return nil
+}
+
+func UpdateWispIDInDependenciesInTx(ctx context.Context, tx *sql.Tx, oldID, newID string) error {
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE dependencies SET depends_on_wisp_id = ? WHERE depends_on_wisp_id = ?",
+		newID, oldID); err != nil {
+		return fmt.Errorf("update wisp %s -> %s in dependencies: %w", oldID, newID, err)
 	}
 	return nil
 }
@@ -201,21 +291,28 @@ func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID 
 // transaction, including labels. Automatically routes each ID to the correct
 // table (issues/wisps). Uses batched IN clauses.
 //
+// wispSet is an optional pre-built set of active wisp IDs scoped to
+// cover ids (see WispIDSetInTx). Pass nil to have the helper build
+// a scoped set internally; callers hydrating multiple batches inside
+// one tx can build the set once over the union of their IDs and
+// reuse it across calls.
+//
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
-func GetIssuesByIDsInTx(ctx context.Context, tx *sql.Tx, ids []string) ([]*types.Issue, error) {
+func GetIssuesByIDsInTx(ctx context.Context, tx *sql.Tx, ids []string, wispSet map[string]struct{}) ([]*types.Issue, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
-	// Partition IDs by wisp status.
-	var wispIDs, permIDs []string
-	for _, id := range ids {
-		if IsActiveWispInTx(ctx, tx, id) {
-			wispIDs = append(wispIDs, id)
-		} else {
-			permIDs = append(permIDs, id)
+	if wispSet == nil {
+		var err error
+		wispSet, err = WispIDSetInTx(ctx, tx, ids)
+		if err != nil {
+			return nil, fmt.Errorf("get issues by IDs: build wisp set: %w", err)
 		}
 	}
+
+	// Partition IDs by wisp status.
+	wispIDs, permIDs := partitionByWispSet(ids, wispSet)
 
 	var allIssues []*types.Issue
 	for _, pair := range []struct {
@@ -335,7 +432,7 @@ func GetDependenciesWithMetadataInTx(ctx context.Context, tx *sql.Tx, issueID st
 	for i, d := range deps {
 		ids[i] = d.depID
 	}
-	issues, err := GetIssuesByIDsInTx(ctx, tx, ids)
+	issues, err := GetIssuesByIDsInTx(ctx, tx, ids, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get dependencies: fetch issues: %w", err)
 	}
@@ -398,7 +495,7 @@ func GetDependentsWithMetadataInTx(ctx context.Context, tx *sql.Tx, issueID stri
 	for i, d := range deps {
 		ids[i] = d.depID
 	}
-	issues, err := GetIssuesByIDsInTx(ctx, tx, ids)
+	issues, err := GetIssuesByIDsInTx(ctx, tx, ids, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get dependents: fetch issues: %w", err)
 	}
@@ -451,7 +548,7 @@ func GetDependenciesInTx(ctx context.Context, tx *sql.Tx, issueID string) ([]*ty
 		return nil, nil
 	}
 
-	return GetIssuesByIDsInTx(ctx, tx, ids)
+	return GetIssuesByIDsInTx(ctx, tx, ids, nil)
 }
 
 // GetDependentsInTx returns issues that depend on the given issueID.
@@ -484,5 +581,5 @@ func GetDependentsInTx(ctx context.Context, tx *sql.Tx, issueID string) ([]*type
 		return nil, nil
 	}
 
-	return GetIssuesByIDsInTx(ctx, tx, ids)
+	return GetIssuesByIDsInTx(ctx, tx, ids, nil)
 }
